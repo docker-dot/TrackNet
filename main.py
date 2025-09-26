@@ -63,6 +63,28 @@ class TrainingPlan:
 
 
 @dataclass
+class ForecastPlan:
+    """Suggestions for predicting complete trajectories from limited observations."""
+
+    input_representation: str
+    decoder_strategy: str
+    constraints: List[str]
+    evaluation: List[str]
+
+    def render(self) -> str:
+        lines = [
+            "全局轨迹预测建议:",
+            f"  * 输入表示: {self.input_representation}",
+            f"  * 解码策略: {self.decoder_strategy}",
+            "  约束融合:",
+        ]
+        lines.extend(f"    - {constraint}" for constraint in self.constraints)
+        lines.append("  评估方法:")
+        lines.extend(f"    - {item}" for item in self.evaluation)
+        return "\n".join(lines)
+
+
+@dataclass
 class CodeStub:
     """Minimal code scaffold demonstrating TrackNet 核心结构."""
 
@@ -71,6 +93,7 @@ class CodeStub:
     model_class: str
     train_function: str
     evaluate_function: str
+    inference_function: str
 
     def render(self) -> str:
         sections = [
@@ -79,6 +102,7 @@ class CodeStub:
             self.model_class.strip(),
             self.train_function.strip(),
             self.evaluate_function.strip(),
+            self.inference_function.strip(),
         ]
         return "\n\n\n".join(sections) + "\n"
 
@@ -87,37 +111,52 @@ def build_plan() -> Dict[str, str]:
     """Construct the recommendations for TrackNet implementation."""
 
     data_plan = DataPlan(
-        description="为每个视频帧生成带高斯热力图的标签，同时保存原始帧与标注掩码。",
+        description="在 MOT 序列上构建观测-预测配对，既可训练像素热力图也能训练轨迹序列。",
         steps=[
-            "将视频拆分为逐帧图像，统一分辨率与帧率。",
-            "为球心坐标绘制二维高斯核，作为模型预测目标。",
-            "依据数据量划分训练/验证/测试集，保持时间连续性不被破坏。",
-            "使用 JSON 或 CSV 元数据记录文件路径与标注信息，便于自定义 Dataset。",
+            "将视频拆分为逐帧图像并缓存检测框、ID 与时间戳信息。",
+            "基于目标 ID 生成轨迹切片：例如前 8 帧作为观察段、后续全程作为预测目标。",
+            "将观察段转换为统一的数值特征（中心点、速度、检测置信度、外观嵌入等）。",
+            "将标签整理为固定长度或可变长度的未来轨迹，并保存为 JSON/NPZ，便于 Dataset 直接加载。",
         ],
     )
 
     model_plan = ModelPlan(
-        backbone="使用轻量化的编码器，例如 MobileNetV2 或 ResNet-18。",
-        decoder="采用多尺度反卷积/上采样以生成单通道热力图输出。",
+        backbone="使用外观与运动编码双分支：CNN 处理图像裁剪，Transformer Encoder 聚合时间特征。",
+        decoder="采用序列到序列的 Transformer Decoder 或基于 GRU 的多层解码器，一次性输出整段轨迹。",
         loss_functions=[
-            "MSELoss: 对预测热力图与目标热力图进行像素级回归。",
-            "FocalLoss: 针对正负样本不平衡进行加权。",
-            "L1Loss: 作为附加监督以稳定训练。",
+            "SmoothL1Loss: 稳定回归未来位置。",
+            "Velocity/Acceleration Loss: 对速度和加速度差分进行约束，保持轨迹平滑。",
+            "Collision Loss: 在同一帧惩罚预测轨迹与其他轨迹过近。",
         ],
     )
 
     training_plan = TrainingPlan(
-        optimizer="AdamW，初始学习率 1e-3，配合权重衰减。",
-        scheduler="CosineAnnealingLR 或 OneCycleLR，适配较长训练周期。",
+        optimizer="AdamW，初始学习率 2e-4，结合梯度裁剪。",
+        scheduler="CosineAnnealingLR 或 ReduceLROnPlateau，根据 ADE/FDE 指标调整。",
         metrics=[
-            "平均精度 (mAP) 在不同距离阈值下的表现。",
-            "像素级召回率与精确率，用于热力图质量评估。",
-            "球心回归误差（像素单位）。",
+            "ADE/FDE：平均与最终位置误差。",
+            "轨迹完整率：模型是否在整段时间内保持有效预测。",
+            "ID F1：将预测的整段轨迹与真实轨迹匹配的稳定性。",
         ],
         augmentations=[
-            "随机旋转、平移与缩放，增强空间泛化能力。",
-            "色彩抖动以模拟不同光照条件。",
-            "基于时间轴的邻帧混合 (temporal mixing) 提高序列建模能力。",
+            "随机丢弃观测帧 (observation dropout) 以模拟遮挡。",
+            "空间扰动：对坐标进行微小仿射变换，提升稳健性。",
+            "时长扰动：随机缩短或延长观测窗口，提高泛化能力。",
+        ],
+    )
+
+    forecast_plan = ForecastPlan(
+        input_representation="组合目标初始几帧的位置、速度、ReID 特征以及场景占据图。",
+        decoder_strategy="使用自回归掩码的 Transformer 解码器或多层 MLP 直接输出全部未来位置。",
+        constraints=[
+            "轨迹要遵循物理约束：添加速度平滑或社会力 (social force) 正则项。",
+            "引入地图或可行区域掩码，避免穿越静态障碍物。",
+            "通过对同场景轨迹做批量建模，实现同一时间的多目标互斥。",
+        ],
+        evaluation=[
+            "对整段预测的轨迹使用 Hungarian Matching 与真实轨迹对齐。",
+            "绘制轨迹热力图/笛卡尔坐标对比，检查早期误差累积。",
+            "在验证集上统计超出图像边界或与障碍交叉的比例。",
         ],
     )
 
@@ -125,6 +164,7 @@ def build_plan() -> Dict[str, str]:
         "data": data_plan.render(),
         "model": model_plan.render(),
         "training": training_plan.render(),
+        "forecast": forecast_plan.render(),
     }
 
 
@@ -137,97 +177,132 @@ def build_code_stub() -> CodeStub:
         from torch import nn
         from torch.utils.data import Dataset, DataLoader
 
-        from typing import Dict, Tuple, List
+        from typing import Dict, List, Tuple
         """
     )
 
     dataset_class = textwrap.dedent(
         """
-        class TrackNetDataset(Dataset):
-            \"\"\"示例数据集，需根据实际标注进行扩展。\"\"\"
+        class TrajectorySequenceDataset(Dataset):
+            \"\"\"根据 MOT 轨迹构建的序列数据集。\"\"\"
 
-            def __init__(self, samples: List[Dict]):
+            def __init__(self, samples: List[Dict], obs_len: int, pred_len: int):
                 self.samples = samples
+                self.obs_len = obs_len
+                self.pred_len = pred_len
 
             def __len__(self) -> int:
                 return len(self.samples)
 
-            def __getitem__(self, idx: int):
+            def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
                 sample = self.samples[idx]
-                frame = sample["frame"]  # 预处理后的图像张量
-                heatmap = sample["heatmap"]  # 对应的高斯热力图
-                return frame, heatmap
+                observation = sample["observation"]  # 形状 [obs_len, feature_dim]
+                target = sample["future"]  # 形状 [pred_len, 2]
+                return observation, target
         """
     )
 
     model_class = textwrap.dedent(
         """
-        class TrackNet(nn.Module):
-            \"\"\"简化版 TrackNet，编码器-解码器结构。\"\"\"
+        class GlobalTrajectoryForecaster(nn.Module):
+            \"\"\"利用 Transformer 结构一次性预测完整轨迹。\"\"\"
 
-            def __init__(self, in_channels: int = 3):
+            def __init__(self, feature_dim: int, hidden_dim: int = 128, pred_len: int = 60):
                 super().__init__()
-                self.encoder = nn.Sequential(
-                    nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(32),
-                    nn.ReLU(inplace=True),
-                    nn.MaxPool2d(2),
-                    nn.Conv2d(32, 64, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(64),
-                    nn.ReLU(inplace=True),
-                    nn.MaxPool2d(2),
+                encoder_layer = nn.TransformerEncoderLayer(
+                    d_model=hidden_dim,
+                    nhead=4,
+                    batch_first=True,
+                    dropout=0.1,
                 )
+                self.input_proj = nn.Linear(feature_dim, hidden_dim)
+                self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=3)
+                self.future_positional = nn.Parameter(torch.randn(pred_len, hidden_dim))
                 self.decoder = nn.Sequential(
-                    nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),
+                    nn.LayerNorm(hidden_dim),
+                    nn.Linear(hidden_dim, hidden_dim),
                     nn.ReLU(inplace=True),
-                    nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(16, 1, kernel_size=1),
-                    nn.Sigmoid(),
+                    nn.Linear(hidden_dim, 2),
                 )
 
-            def forward(self, x: torch.Tensor) -> torch.Tensor:
-                x = self.encoder(x)
-                x = self.decoder(x)
-                return x
+            def forward(self, observation: torch.Tensor) -> torch.Tensor:
+                # observation: [batch, obs_len, feature_dim]
+                x = self.input_proj(observation)
+                memory = self.encoder(x)
+                batch_size = memory.size(0)
+                query = self.future_positional.unsqueeze(0).expand(batch_size, -1, -1)
+                context = memory.mean(dim=1, keepdim=True)
+                decoded = query + context
+                outputs = self.decoder(decoded)
+                return outputs  # [batch, pred_len, 2]
         """
     )
 
     train_function = textwrap.dedent(
         """
-        def train(model: TrackNet, dataloader: DataLoader, *, device: torch.device, epochs: int = 10):
-            criterion = nn.MSELoss()
-            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-            model.to(device)
-
-            for epoch in range(epochs):
-                model.train()
-                total_loss = 0.0
-                for frames, heatmaps in dataloader:
-                    frames = frames.to(device)
-                    heatmaps = heatmaps.to(device)
-                    optimizer.zero_grad()
-                    outputs = model(frames)
-                    loss = criterion(outputs, heatmaps)
-                    loss.backward()
-                    optimizer.step()
-                    total_loss += loss.item() * frames.size(0)
-                print(f"Epoch {epoch + 1}: loss={total_loss / len(dataloader.dataset):.4f}")
+        def train_epoch(
+            model: GlobalTrajectoryForecaster,
+            dataloader: DataLoader,
+            *,
+            device: torch.device,
+            optimizer: torch.optim.Optimizer,
+            criterion: nn.Module,
+        ) -> float:
+            model.train()
+            total_loss = 0.0
+            for observation, target in dataloader:
+                observation = observation.to(device)
+                target = target.to(device)
+                optimizer.zero_grad()
+                pred = model(observation)
+                loss = criterion(pred, target)
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                total_loss += loss.item() * observation.size(0)
+            return total_loss / len(dataloader.dataset)
         """
     )
 
     evaluate_function = textwrap.dedent(
         """
-        def evaluate(model: TrackNet, dataloader: DataLoader, *, device: torch.device):
+        def evaluate(
+            model: GlobalTrajectoryForecaster,
+            dataloader: DataLoader,
+            *,
+            device: torch.device,
+        ) -> Dict[str, float]:
             model.eval()
-            total_error = 0.0
+            total_ade = 0.0
+            total_fde = 0.0
+            count = 0
             with torch.no_grad():
-                for frames, heatmaps in dataloader:
-                    frames = frames.to(device)
-                    heatmaps = heatmaps.to(device)
-                    outputs = model(frames)
-                    total_error += nn.functional.l1_loss(outputs, heatmaps, reduction="sum").item()
-            print(f"Average L1 error: {total_error / len(dataloader.dataset):.4f}")
+                for observation, target in dataloader:
+                    observation = observation.to(device)
+                    target = target.to(device)
+                    pred = model(observation)
+                    ade = torch.norm(pred - target, dim=-1).mean(dim=-1)
+                    fde = torch.norm(pred[:, -1] - target[:, -1], dim=-1)
+                    total_ade += ade.sum().item()
+                    total_fde += fde.sum().item()
+                    count += observation.size(0)
+            return {"ADE": total_ade / count, "FDE": total_fde / count}
+        """
+    )
+
+    inference_function = textwrap.dedent(
+        """
+        def predict_full_trajectory(
+            model: GlobalTrajectoryForecaster,
+            observation: torch.Tensor,
+            *,
+            device: torch.device,
+        ) -> torch.Tensor:
+            model.eval()
+            with torch.no_grad():
+                observation = observation.to(device)
+                pred = model(observation.unsqueeze(0))
+            return pred.squeeze(0).cpu()
         """
     )
 
@@ -237,6 +312,7 @@ def build_code_stub() -> CodeStub:
         model_class=model_class,
         train_function=train_function,
         evaluate_function=evaluate_function,
+        inference_function=inference_function,
     )
 
 
@@ -248,7 +324,7 @@ def export_stub(path: Path) -> None:
 
 
 def print_plan(plan: Dict[str, str]) -> None:
-    for section in ("data", "model", "training"):
+    for section in ("data", "model", "training", "forecast"):
         print(plan[section])
         print("\n" + "=" * 60 + "\n")
 
